@@ -685,6 +685,8 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t
             case 0x6C: // XGKICK - send GIF packet from VU1 data memory
                 startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])));
                 return;
+            // EFU encodings follow the VU manual / PCSX2 tables: 0x77 and 0x7F are
+            // reserved, ERSQRT is 0x79, ESIN 0x7C, EATAN 0x7D and EEXP 0x7E.
             case 0x70: // ESADD
             {
                 const float x = normalizeOperand(m_state.vf[vfS][0]);
@@ -741,7 +743,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t
                 queueP(sum, 12u);
                 return;
             }
-            case 0x77: // ERSQRT
+            case 0x79: // ERSQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -762,7 +764,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t
                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
                 return;
             }
-            case 0x79: // ESIN
+            case 0x7C: // ESIN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -778,13 +780,13 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t
             }
             case 0x7B: // WAITP
                 return;
-            case 0x7C: // EATAN
+            case 0x7D: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
-            case 0x7D: // EEXP
+            case 0x7E: // EEXP
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);

@@ -1514,7 +1514,7 @@ PS2_VU_FORCE_INLINE void Frame::lower(float *vfResult, int32_t &viResult)
             Access::startXgkick(m_run.m_vu, static_cast<uint16_t>(m_state.vi[viS]));
             m_kickActive = Access::xgkickActive(m_run.m_vu);
         }
-        else if constexpr (special >= 0x70u && special <= 0x7Du) // EFU
+        else if constexpr (special >= 0x70u && special <= 0x7Eu && special != 0x77u) // EFU
         {
             const float *source = m_state.vf[vfS];
             const float x = normalizeOperand(source[0]), y = normalizeOperand(source[1]);
@@ -1560,7 +1560,7 @@ PS2_VU_FORCE_INLINE void Frame::lower(float *vfResult, int32_t &viResult)
                 result = 0.0f + x + y + z + normalizeOperand(source[3]);
                 latency = 12u;
             }
-            else if constexpr (special == 0x77u) // ERSQRT
+            else if constexpr (special == 0x79u) // ERSQRT
             {
                 result = component;
                 if (result >= 0.0f)
@@ -1576,7 +1576,7 @@ PS2_VU_FORCE_INLINE void Frame::lower(float *vfResult, int32_t &viResult)
                 result = component >= 0.0f ? std::sqrt(component) : component;
                 latency = 12u;
             }
-            else if constexpr (special == 0x79u) // ESIN
+            else if constexpr (special == 0x7Cu) // ESIN
             {
                 result = ps2_vu_detail::vuEsin(component);
                 latency = 29u;
@@ -1586,12 +1586,12 @@ PS2_VU_FORCE_INLINE void Frame::lower(float *vfResult, int32_t &viResult)
                 result = component != 0.0f ? 1.0f / component : component;
                 latency = 12u;
             }
-            else if constexpr (special == 0x7Cu) // EATAN
+            else if constexpr (special == 0x7Du) // EATAN
             {
                 result = ps2_vu_detail::vuEatan(component);
                 latency = 54u;
             }
-            else if constexpr (special == 0x7Du) // EEXP
+            else if constexpr (special == 0x7Eu) // EEXP
             {
                 result = ps2_vu_detail::vuEexp(component);
                 latency = 44u;

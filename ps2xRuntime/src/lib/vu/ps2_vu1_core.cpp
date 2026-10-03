@@ -8,6 +8,8 @@
 #include "ps2_vu1_capture.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <bit>
 #include <cfenv>
 #include <cmath>
@@ -66,7 +68,17 @@ void VU1Interpreter::resetScheduler()
     m_viWritePipeline = {};
     m_accWritePipeline = {};
     m_activeFlags = m_activeStores = m_activeVfWrites = m_activeViWrites = m_activeAccWrites = 0u;
-    m_xgkick = {};
+    // Reset the PATH1 transfer state but not its 64 KiB packet buffer: every
+    // byte is copied in before it is read or submitted, and clearing it here
+    // ran at every MSCAL (about 1 GB/s of memset in DQ8's open world).
+    m_xgkick.sourceAddress = 0;
+    m_xgkick.totalBytes = 0;
+    m_xgkick.copiedBytes = 0;
+    m_xgkick.currentTagEnd = 0;
+    m_xgkick.cycleCredit = 0;
+    m_xgkick.issueCycle = 0;
+    m_xgkick.active = false;
+    m_xgkick.currentTagEop = false;
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -184,8 +196,42 @@ void VU1Interpreter::finishXgkick()
     m_xgkick.active = false;
 }
 
+
+namespace
+{
+    // DQ8_TRACE_VU1_RATE prints VU1 program starts and XGKICKs per second, to
+    // tell a scene whose models never reach VU1 from one VU1 culls entirely.
+    struct Vu1RateTrace
+    {
+        std::atomic<uint64_t> starts{0}, kicks{0};
+        // run() calls by outcome: compiled program entered, not drained,
+        // budget too small, no routine at the PC; and pairs by path.
+        std::atomic<uint64_t> runs{0}, entered{0}, notDrained{0}, smallBudget{0}, noRoutine{0};
+        std::atomic<uint64_t> nativePairs{0}, interpretedPairs{0};
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        bool enabled = std::getenv("DQ8_TRACE_VU1_RATE") != nullptr;
+        void tick()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - last).count();
+            if (seconds < 2.0)
+                return;
+            last = now;
+            std::fprintf(stderr, "[vu1-rate] %.0f starts/s %.0f kicks/s | runs %.0f/s: compiled %.0f, not-drained %.0f,"
+                                 " small-budget %.0f, no-routine %.0f | pairs native %.0f/s interpreted %.0f/s\n",
+                         starts.exchange(0) / seconds, kicks.exchange(0) / seconds, runs.exchange(0) / seconds,
+                         entered.exchange(0) / seconds, notDrained.exchange(0) / seconds,
+                         smallBudget.exchange(0) / seconds, noRoutine.exchange(0) / seconds,
+                         nativePairs.exchange(0) / seconds, interpretedPairs.exchange(0) / seconds);
+        }
+    };
+    Vu1RateTrace g_vu1Rate;
+}
+
 void VU1Interpreter::startXgkick(uint32_t qwordAddress)
 {
+    if (g_vu1Rate.enabled && m_unit == Unit::VU1)
+        ++g_vu1Rate.kicks;
     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
         return;
 
@@ -281,6 +327,11 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    if (g_vu1Rate.enabled && m_unit == Unit::VU1)
+    {
+        ++g_vu1Rate.starts;
+        g_vu1Rate.tick();
+    }
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     m_state.ebit = false;
@@ -396,15 +447,32 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         rebuildDecodedCodeCache(vuCode, codeSize, memory,
             m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration());
     commitReadyPipelines();
+    const bool rateTrace = g_vu1Rate.enabled && m_unit == Unit::VU1;
+    if (rateTrace)
+    {
+        ++g_vu1Rate.runs;
+        if (budgetEnd - m_cycle < ps2_vu_program::kMinimumBudget)
+            ++g_vu1Rate.smallBudget;
+        else if (!ps2_vu_program::Access::drained(*this))
+            ++g_vu1Rate.notDrained;
+    }
     // A drained VU1 at the entry of a compiled program runs it whole.
     if (trackedCode && m_unit == Unit::VU1 && m_useCompiledExecution &&
         budgetEnd - m_cycle >= ps2_vu_program::kMinimumBudget && ps2_vu_program::Access::drained(*this))
     {
         const uint64_t generation = memory->getVU1CodeGeneration();
         if (const auto routine = ps2_vu_program::find(vuCode, codeSize, m_state.pc, generation))
+        {
+            if (rateTrace)
+                ++g_vu1Rate.entered;
             programEnded = ps2_vu_program::run(*this, vuCode, codeSize, budgetEnd, routine);
+        }
         else
+        {
+            if (rateTrace)
+                ++g_vu1Rate.noRoutine;
             ps2_vu_program::recordMissing(vuCode, codeSize, m_state.pc);
+        }
     }
     while (!programEnded && m_cycle < budgetEnd && !m_stopRequested)
     {
@@ -455,6 +523,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
     const uint64_t pairsAfter = m_compiledPairsExecuted + m_interpretedPairsExecuted;
+    if (rateTrace)
+    {
+        static uint64_t lastNative = 0, lastInterpreted = 0;
+        g_vu1Rate.nativePairs += m_compiledPairsExecuted - lastNative;
+        g_vu1Rate.interpretedPairs += m_interpretedPairsExecuted - lastInterpreted;
+        lastNative = m_compiledPairsExecuted;
+        lastInterpreted = m_interpretedPairsExecuted;
+    }
     if (ps2_vu_detail::profileRegions)
         ps2_vu_detail::regionCounters.total[m_unit == Unit::VU1 ? 1u : 0u] += pairsAfter - pairsBefore;
     if (profileExecution && (pairsBefore >> 24u) != (pairsAfter >> 24u))

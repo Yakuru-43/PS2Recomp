@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ee_scheduler.h"
+#include "runtime/ps2_pad_host.h"
 
 namespace ps2_stubs
 {
@@ -299,6 +301,11 @@ namespace ps2_stubs
             if (!useOverride)
             {
                 uint8_t backendData[32]{};
+                if (runtime)
+                {
+                    // Scripts and recordings are timed by the frame the guest reads at.
+                    ps2PadSetGuestFrame(runtime->eeScheduler().currentVSyncTick());
+                }
                 if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
                 {
                     state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));

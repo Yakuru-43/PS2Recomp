@@ -1,5 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -262,8 +266,46 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+
+namespace
+{
+    // DQ8_TRACE_VU1_RATE: VIF1 packets, bytes and MSCALs per second.
+    struct Vif1RateTrace
+    {
+        std::atomic<uint64_t> packets{0}, bytes{0}, mscals{0};
+        std::atomic<uint64_t> ops[128]{}, opUnits[128]{};
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        bool enabled = std::getenv("DQ8_TRACE_VU1_RATE") != nullptr;
+        void tick()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - last).count();
+            if (seconds < 2.0)
+                return;
+            last = now;
+            std::fprintf(stderr, "[vif1-rate] %.0f packets/s %.0f KiB/s %.0f mscal/s |",
+                         packets.exchange(0) / seconds, bytes.exchange(0) / seconds / 1024.0,
+                         mscals.exchange(0) / seconds);
+            for (unsigned op = 0; op < 128; ++op)
+            {
+                const uint64_t n = ops[op].exchange(0), u = opUnits[op].exchange(0);
+                if (n)
+                    std::fprintf(stderr, " %02x:%.0f/%.0f", op, n / seconds, u / seconds);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    };
+    Vif1RateTrace g_vif1Rate;
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (g_vif1Rate.enabled)
+    {
+        ++g_vif1Rate.packets;
+        g_vif1Rate.bytes += sizeBytes;
+        g_vif1Rate.tick();
+    }
     if (sizeBytes == 0u)
         return;
 
@@ -280,6 +322,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
+        if (g_vif1Rate.enabled)
+        {
+            ++g_vif1Rate.ops[opcode];
+            // units: DIRECT/MPG imm, UNPACK num
+            g_vif1Rate.opUnits[opcode] += ((opcode & 0x60) == 0x60) ? num : imm;
+        }
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
         vif1_regs.num = num;
@@ -345,6 +393,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
+            if (g_vif1Rate.enabled)
+                ++g_vif1Rate.mscals;
             uint32_t startPC = (uint32_t)imm * 8u;
 
             // Values visible to the VU program for this MSCAL.

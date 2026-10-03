@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -196,7 +198,9 @@ namespace
     // itself, entries separated by ';' or newlines:
     //
     //     <guest-frame> <BUTTON>[+<BUTTON>...] [hold-frames]
+    //     <guest-frame> STICK <rx>,<ry>,<lx>,<ly> [hold-frames]
     //
+    // STICK sets both analog sticks (0-255, 128 = centre) for the hold.
     // Timed in guest vsync ticks so a script replays the same way whether the
     // game is running at 3 fps or 60. Lines starting with '#' are comments.
     struct PadScriptEvent
@@ -204,10 +208,15 @@ namespace
         uint64_t frame = 0u;
         uint64_t holdFrames = 4u;
         uint32_t mask = 0u;
+        uint32_t sticks = kPadStickNeutral;
+        bool hasSticks = false;
         bool active = false;
+        bool delivered = false;
     };
 
     std::atomic<uint64_t> g_guestFrame{0u};
+    // Appended to by DQ8_PAD_LIVE on the render thread, read by the EE thread.
+    std::mutex g_padScriptMutex;
     std::vector<PadScriptEvent> g_padScript;
     bool g_padScriptVerbose = false;
 
@@ -230,7 +239,8 @@ namespace
         return it == kNames.end() ? 0u : it->second;
     }
 
-    void parsePadScript(const std::string &text)
+    // Caller holds g_padScriptMutex (or runs before any other thread can see the script).
+    void parsePadScript(const std::string &text, uint64_t base = 0u)
     {
         std::string entry;
         std::istringstream stream(text);
@@ -253,7 +263,29 @@ namespace
                     continue;
                 }
                 PadScriptEvent event{};
-                event.frame = frame;
+                event.frame = base + frame;
+                if (strcasecmp(buttons.c_str(), "STICK") == 0)
+                {
+                    std::string values;
+                    unsigned rx = 0u, ry = 0u, lx = 0u, ly = 0u;
+                    if (!(fields >> values) ||
+                        std::sscanf(values.c_str(), "%u,%u,%u,%u", &rx, &ry, &lx, &ly) != 4)
+                    {
+                        std::fprintf(stderr, "[pad] bad STICK entry in DQ8_PAD_SCRIPT: '%s'\n",
+                                     chunk.c_str());
+                        continue;
+                    }
+                    event.hasSticks = true;
+                    event.sticks = ((rx & 0xFFu) << 24u) | ((ry & 0xFFu) << 16u) |
+                                   ((lx & 0xFFu) << 8u) | (ly & 0xFFu);
+                    uint64_t hold = 0u;
+                    if (fields >> hold && hold > 0u)
+                    {
+                        event.holdFrames = hold;
+                    }
+                    g_padScript.push_back(event);
+                    continue;
+                }
                 uint64_t hold = 0u;
                 if (fields >> hold && hold > 0u)
                 {
@@ -284,7 +316,7 @@ namespace
                 }
             }
         }
-        std::sort(g_padScript.begin(), g_padScript.end(),
+        std::stable_sort(g_padScript.begin(), g_padScript.end(),
                   [](const PadScriptEvent &l, const PadScriptEvent &r) { return l.frame < r.frame; });
     }
 
@@ -297,6 +329,7 @@ namespace
             {
                 return true;
             }
+            std::lock_guard<std::mutex> lock(g_padScriptMutex);
             std::ifstream file(value);
             if (file)
             {
@@ -314,45 +347,211 @@ namespace
         (void)loaded;
     }
 
-    // Merges scripted buttons into whatever the host sampled, so a human can
-    // still take over while a script is running.
-    void applyPadScript(uint32_t &held, uint32_t &pressed)
+    // DQ8_PAD_LIVE=path is a script fed while the game runs: lines appended to
+    // the file use the DQ8_PAD_SCRIPT format, with the frame counted from the
+    // guest frame at which the line is read, so a tool can drive the game a
+    // step at a time from screenshots.
+    void pollPadLive(uint64_t frame)
     {
-        ensurePadScriptLoaded();
-        if (g_padScript.empty())
+        static const std::string path = [] {
+            const char *value = std::getenv("DQ8_PAD_LIVE");
+            return std::string(value != nullptr ? value : "");
+        }();
+        static std::streamoff consumed = 0;
+        static uint64_t lastPoll = 0u;
+        if (path.empty() || (frame < lastPoll + 4u && lastPoll != 0u))
         {
             return;
         }
-        const uint64_t frame = g_guestFrame.load(std::memory_order_relaxed);
-        for (PadScriptEvent &event : g_padScript)
+        lastPoll = frame;
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
         {
-            const bool on = frame >= event.frame && frame < event.frame + event.holdFrames;
-            if (on)
-            {
-                held |= event.mask;
-                if (!event.active)
-                {
-                    pressed |= event.mask;
-                    event.active = true;
-                    if (g_padScriptVerbose)
-                    {
-                        std::fprintf(stderr, "[pad] frame %llu: press 0x%04x\n",
-                                     static_cast<unsigned long long>(frame), event.mask);
-                    }
-                }
-            }
-            else
-            {
-                event.active = false;
-            }
+            return;
+        }
+        file.seekg(0, std::ios::end);
+        const std::streamoff size = file.tellg();
+        if (size < consumed)
+        {
+            consumed = 0;
+        }
+        if (size == consumed)
+        {
+            return;
+        }
+        file.seekg(consumed);
+        std::string text(static_cast<size_t>(size - consumed), '\0');
+        file.read(text.data(), static_cast<std::streamsize>(text.size()));
+        // Only whole lines; a writer may be midway through the last one.
+        const size_t end = text.rfind('\n');
+        if (end == std::string::npos)
+        {
+            return;
+        }
+        text.resize(end + 1u);
+        consumed += static_cast<std::streamoff>(text.size());
+        std::lock_guard<std::mutex> lock(g_padScriptMutex);
+        parsePadScript(text, frame);
+        if (g_padScriptVerbose)
+        {
+            std::fprintf(stderr, "[pad] frame %llu: live script read\n",
+                         static_cast<unsigned long long>(frame));
         }
     }
+
+    // Merges scripted buttons into what the guest is about to read, so a human
+    // can still take over while a script is running. Applied at the guest's
+    // pad read rather than on the render thread, so a replay sees the press at
+    // the same guest frame it was recorded at. A press whose whole window fell
+    // between two guest reads is still handed over once, at the next read.
+    void applyPadScript(uint64_t frame, uint32_t &active, uint32_t &sticks)
+    {
+        ensurePadScriptLoaded();
+        std::lock_guard<std::mutex> lock(g_padScriptMutex);
+        for (PadScriptEvent &event : g_padScript)
+        {
+            if (frame < event.frame)
+            {
+                break;
+            }
+            const bool on = frame < event.frame + event.holdFrames;
+            if (on || !event.delivered)
+            {
+                active |= event.mask;
+                if (event.hasSticks)
+                {
+                    sticks = event.sticks;
+                }
+                if (!event.active && g_padScriptVerbose)
+                {
+                    std::fprintf(stderr, "[pad] frame %llu: press 0x%04x\n",
+                                 static_cast<unsigned long long>(frame), event.mask);
+                }
+                event.delivered = true;
+            }
+            event.active = on;
+        }
+    }
+
+    // DQ8_PAD_RECORD=path writes the buttons the guest reads, in the
+    // DQ8_PAD_SCRIPT format, so a session played by hand can be replayed with
+    // DQ8_PAD_SCRIPT=path. One line per button press or stick position,
+    // written when it ends.
+    class PadRecorder
+    {
+    public:
+        PadRecorder()
+        {
+            const char *value = std::getenv("DQ8_PAD_RECORD");
+            if (value == nullptr || *value == '\0')
+            {
+                return;
+            }
+            m_file = std::fopen(value, "w");
+            if (m_file == nullptr)
+            {
+                std::fprintf(stderr, "[pad] DQ8_PAD_RECORD: cannot open '%s'\n", value);
+                return;
+            }
+            std::fprintf(m_file, "# DQ8_PAD_RECORD: <guest-frame> <button> <hold-frames>\n");
+            std::fflush(m_file);
+            std::fprintf(stderr, "[pad] DQ8_PAD_RECORD: recording to %s\n", value);
+        }
+
+        ~PadRecorder()
+        {
+            if (m_file != nullptr)
+            {
+                // Buttons still down at exit, so the tail of a session is kept.
+                record(m_lastFrame + 1u, 0u, kPadStickNeutral);
+                std::fclose(m_file);
+            }
+        }
+
+        void record(uint64_t frame, uint32_t active, uint32_t sticks)
+        {
+            if (m_file == nullptr)
+            {
+                return;
+            }
+            m_lastFrame = frame;
+            if (sticks != m_sticks)
+            {
+                if (m_sticks != kPadStickNeutral)
+                {
+                    std::fprintf(m_file, "%llu STICK %u,%u,%u,%u %llu\n",
+                                 static_cast<unsigned long long>(m_sticksAt), m_sticks >> 24u,
+                                 (m_sticks >> 16u) & 0xFFu, (m_sticks >> 8u) & 0xFFu, m_sticks & 0xFFu,
+                                 static_cast<unsigned long long>(std::max<uint64_t>(1u, frame - m_sticksAt)));
+                }
+                m_sticks = sticks;
+                m_sticksAt = frame;
+            }
+            const uint32_t changed = active ^ m_active;
+            if (changed == 0u)
+            {
+                std::fflush(m_file);
+                return;
+            }
+            for (uint32_t bit = 1u; bit <= 0x8000u; bit <<= 1u)
+            {
+                if ((changed & bit) == 0u)
+                {
+                    continue;
+                }
+                const int index = __builtin_ctz(bit);
+                if ((active & bit) != 0u)
+                {
+                    m_downAt[index] = frame;
+                }
+                else
+                {
+                    std::fprintf(m_file, "%llu %s %llu\n",
+                                 static_cast<unsigned long long>(m_downAt[index]), buttonName(bit),
+                                 static_cast<unsigned long long>(std::max<uint64_t>(1u, frame - m_downAt[index])));
+                }
+            }
+            std::fflush(m_file);
+            m_active = active;
+        }
+
+    private:
+        static const char *buttonName(uint32_t bit)
+        {
+            switch (bit)
+            {
+            case PAD_UP: return "UP";
+            case PAD_DOWN: return "DOWN";
+            case PAD_LEFT: return "LEFT";
+            case PAD_RIGHT: return "RIGHT";
+            case PAD_CROSS: return "CROSS";
+            case PAD_CIRCLE: return "CIRCLE";
+            case PAD_SQUARE: return "SQUARE";
+            case PAD_TRIANGLE: return "TRIANGLE";
+            case PAD_START: return "START";
+            case PAD_SELECT: return "SELECT";
+            case PAD_L1: return "L1";
+            case PAD_R1: return "R1";
+            case PAD_L2: return "L2";
+            case PAD_R2: return "R2";
+            case PAD_L3: return "L3";
+            default: return "R3";
+            }
+        }
+
+        std::FILE *m_file = nullptr;
+        uint32_t m_active = 0u;
+        uint64_t m_downAt[16]{};
+        uint64_t m_lastFrame = 0u;
+        uint32_t m_sticks = kPadStickNeutral;
+        uint64_t m_sticksAt = 0u;
+    };
 
     // Shared tail of both host paths: publish held state and latch edges long
     // enough that a tap between two guest polls is not lost.
     void publishHostState(uint32_t held, uint32_t pressed, uint32_t sticks)
     {
-        applyPadScript(held, pressed);
+        pollPadLive(g_guestFrame.load(std::memory_order_relaxed));
         g_held.store(held);
         g_sticks.store(sticks);
 
@@ -384,7 +583,12 @@ void ps2PadPublishHostState(uint32_t held, uint32_t pressed, uint32_t sticks)
 
 void ps2PadSetGuestFrame(uint64_t frame)
 {
-    g_guestFrame.store(frame, std::memory_order_relaxed);
+    // Set by both the present loop and the guest's pad read; never step back.
+    uint64_t current = g_guestFrame.load(std::memory_order_relaxed);
+    while (current < frame &&
+           !g_guestFrame.compare_exchange_weak(current, frame, std::memory_order_relaxed))
+    {
+    }
 }
 
 uint64_t ps2PadCurrentGuestFrame()
@@ -432,6 +636,11 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         uint32_t pressed = 0u;
         sampleHost(false, active, pressed, sticks);
     }
+
+    const uint64_t frame = g_guestFrame.load(std::memory_order_relaxed);
+    applyPadScript(frame, active, sticks);
+    static PadRecorder recorder;
+    recorder.record(frame, active, sticks);
 
     data[4] = static_cast<uint8_t>(sticks >> 24);
     data[5] = static_cast<uint8_t>(sticks >> 16);
