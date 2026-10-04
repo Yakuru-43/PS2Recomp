@@ -1839,6 +1839,23 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     for (int i = 0; i < batch.vertexCount; ++i)
         batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
     batch.state.context = m_ctx[m_prim.ctxt ? 1 : 0];
+    // The GS draws in 11-bit window coordinates, so a vertex 2048 pixels or
+    // more past XYOFFSET wraps back to the start of the drawing area. DQ8's
+    // water scrolls a 64x64 tile in four pieces whose top edge it places at
+    // window y 2048, meaning 0; taken literally, a piece smeared one texel
+    // row down the tile, and the river showed a white band that grew with
+    // the scroll and reset. No vertex there can be inside the 2048x2048
+    // drawing area, so nothing else changes.
+    const float offsetX = static_cast<float>(batch.state.context.xyoffset.ofx) / 16.0f;
+    const float offsetY = static_cast<float>(batch.state.context.xyoffset.ofy) / 16.0f;
+    for (int i = 0; i < batch.vertexCount; ++i)
+    {
+        GSVertex &vertex = batch.vertices[static_cast<size_t>(i)];
+        if (vertex.x - offsetX >= 2048.0f)
+            vertex.x -= 2048.0f;
+        if (vertex.y - offsetY >= 2048.0f)
+            vertex.y -= 2048.0f;
+    }
     batch.state.prim = m_prim;
     batch.state.texa = m_texa;
     batch.state.texclut = m_texclut;
