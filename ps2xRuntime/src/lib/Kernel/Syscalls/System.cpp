@@ -11,6 +11,7 @@ namespace ps2_syscalls
 
         if (runtime)
         {
+            runtime->memory().mtvuSync();
             auto &gs = runtime->memory().gs();
             const uint64_t smode2 =
                 (static_cast<uint64_t>(interlaced) & 0x1ull) |

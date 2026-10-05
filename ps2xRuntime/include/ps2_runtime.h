@@ -307,6 +307,9 @@ public:
 
     bool initialize(const char *title = "PS2 Game");
     bool syncCoreSubsystems();
+    void updateVu1StopBits(R5900Context &context);
+    // VIF1/VU1 and GIF DMA on a worker thread (MTVU).
+    void setMtvuEnabled(bool enabled);
     bool loadELF(const std::string &elfPath);
     void run();
 
@@ -490,8 +493,19 @@ public:
     inline PS2Memory &memory() { return m_memory; }
     inline const PS2Memory &memory() const { return m_memory; }
 
-    inline GS &gs() { return m_gs; }
-    inline const GS &gs() const { return m_gs; }
+    // The GS frontend, after any queued MTVU work has reached it.
+    inline GS &gs()
+    {
+        m_memory.mtvuSync();
+        return m_gs;
+    }
+    inline const GS &gs() const
+    {
+        m_memory.mtvuSync();
+        return m_gs;
+    }
+    // For the presenter, which latches whatever the GS has and must not wait.
+    inline GS &gsUnsynced() { return m_gs; }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
     inline VU1Interpreter &vu0() { return m_vu0; }

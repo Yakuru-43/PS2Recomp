@@ -416,7 +416,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        rt->gsUnsynced().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -433,7 +433,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    if (!rt->gsUnsynced().copyLatchedHostPresentationFrame(s_scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
@@ -576,6 +576,8 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        // The MTVU worker drives VU1 and the GS, which are destroyed first.
+        m_memory.setMtvuEnabled(false);
         // The audio callback renders from the IOP subsystem.
         ps2_native_iop::stopAudio();
         m_iopSubsystem.reset();
@@ -646,6 +648,26 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
     return m_iopSubsystem->debugSnapshot();
 }
 
+// With MTVU the worker runs this while the EE owns the context, so it only
+// stores when the bits change, which needs a D or T bit stop in practice.
+void PS2Runtime::setMtvuEnabled(bool enabled)
+{
+    m_memory.setMtvuFbrstSource([this] {
+        R5900Context *context = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+        return (context ? context : &m_cpuContext)->vu0_fbrst;
+    });
+    m_memory.setMtvuEnabled(enabled);
+    std::fprintf(stderr, "[mtvu] VU1 on its own thread: %s\n", enabled ? "on" : "off");
+}
+
+void PS2Runtime::updateVu1StopBits(R5900Context &context)
+{
+    const uint32_t bits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                          (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+    if ((context.vu0_vpu_stat & 0x0600u) != bits)
+        context.vu0_vpu_stat = (context.vu0_vpu_stat & ~0x0600u) | bits;
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -666,40 +688,38 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // The MTVU worker uses the FBRST captured with its job.
+                                     const bool worker = m_memory.onMtvuThread();
+                                     R5900Context *cpuContext = (!worker && m_eeScheduler) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = worker ? m_memory.mtvuJobFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (!worker)
+                                         updateVu1StopBits(*cpuContext); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // The MTVU worker uses the FBRST captured with its job.
+                                     const bool worker = m_memory.onMtvuThread();
+                                     R5900Context *cpuContext = (!worker && m_eeScheduler) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = worker ? m_memory.mtvuJobFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (!worker)
+                                         updateVu1StopBits(*cpuContext); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -746,6 +766,9 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+        // PS2_MTVU=1 runs VIF1/VU1 and GIF on their own thread (2: in lockstep).
+        if (const char *mtvu = std::getenv("PS2_MTVU"); mtvu && (std::strcmp(mtvu, "1") == 0 || std::strcmp(mtvu, "2") == 0))
+            setMtvuEnabled(true);
 #if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
     !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
         std::string pluginError;
@@ -2579,7 +2602,7 @@ void PS2Runtime::run()
             const bool newFrame = currentTick != s_lastNativeTick;
             if (newFrame)
             {
-                if (!presentHostFrame(*this, [&] { gs().latchHostPresentationFrame(); }))
+                if (!presentHostFrame(*this, [&] { gsUnsynced().latchHostPresentationFrame(); }))
                     break;
                 s_lastNativeTick = currentTick;
             }
