@@ -283,6 +283,11 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
+    // From any thread: run guest `function` with a0..a3 and the main
+    // thread's $gp, as an invocation at the EE's next safe point. For host
+    // tools that drive the game through its own code (debug menus). Calls run
+    // one after another, in the order requested, never nested in each other.
+    void requestGuestCall(uint32_t function, const std::array<uint32_t, 4> &args);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
@@ -485,6 +490,16 @@ private:
     mutable std::mutex m_eventMutex;
     std::condition_variable m_eventCv;
     std::deque<EeEvent> m_events;
+    struct HostGuestCall
+    {
+        uint32_t function;
+        std::array<uint32_t, 4> args;
+    };
+    std::mutex m_hostCallMutex;
+    std::deque<HostGuestCall> m_hostCalls;
+    std::atomic<bool> m_hostCallsPending{false};
+    // Executor only: a host call is running, so the next one waits for it.
+    bool m_hostCallRunning = false;
     // Nonzero while m_events has anything in it. The post-dispatch pump's
     // tail used to take m_eventMutex to ask m_events.empty(); at the movie
     // thread's ~4M pumps a second that mutex pair was measurable, and the
