@@ -465,6 +465,17 @@ void EeScheduler::requestStop()
     m_eventCv.notify_all();
 }
 
+void EeScheduler::requestGuestCall(uint32_t function, const std::array<uint32_t, 4> &args)
+{
+    {
+        std::lock_guard lock(m_hostCallMutex);
+        m_hostCalls.push_back({function, args});
+    }
+    m_hostCallsPending.store(true, std::memory_order_release);
+    m_checkpointPending.store(true, std::memory_order_release);
+    m_eventCv.notify_all();
+}
+
 void EeScheduler::postEvent(EeEvent event)
 {
     if (event.type == EeEventType::Stop)
@@ -2144,6 +2155,44 @@ void EeScheduler::processPendingEvents()
         if ((timerInterrupts & (1u << timer)) != 0u)
         {
             dispatchIrq(false, 9u + timer);
+        }
+    }
+    if (!m_hostCallRunning && m_hostCallsPending.exchange(false, std::memory_order_acq_rel))
+    {
+        // One at a time: an invocation nests on the running thread, so a
+        // second one queued now would start on top of the first as soon as
+        // it reached a safe point, and the game's code isn't reentrant.
+        HostGuestCall call{};
+        bool found = false;
+        {
+            std::lock_guard lock(m_hostCallMutex);
+            while (!m_hostCalls.empty() && !found)
+            {
+                call = m_hostCalls.front();
+                m_hostCalls.pop_front();
+                found = m_runtime.hasFunction(call.function);
+            }
+            if (!m_hostCalls.empty())
+                m_hostCallsPending.store(true, std::memory_order_release);
+        }
+        if (found)
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::HleCall;
+            invocation.context.pc = call.function;
+            for (int i = 0; i < 4; ++i)
+                SET_GPR_U32(&invocation.context, 4 + i, call.args[static_cast<size_t>(i)]);
+            const GuestThread *main = thread(kMainThreadId);
+            SET_GPR_U32(&invocation.context, 28, main ? main->gp : 0u);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.onComplete = [this](const R5900Context &, R5900Context &)
+            {
+                m_hostCallRunning = false;
+                m_checkpointPending.store(true, std::memory_order_release);
+            };
+            m_hostCallRunning = true;
+            queueInvocation(std::move(invocation));
         }
     }
     // INTC VIF0 (4) and VIF1 (5), raised by a VIFcode carrying the i bit.
