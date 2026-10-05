@@ -23,6 +23,15 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
+    // PATH1 sorts ahead of everything queued and keeps its own order, so the
+    // drain would run it first anyway. Running it now spares a copy of each
+    // XGKICK packet -- hundreds of thousands a second in DQ8.
+    if (pathId == GifPathId::Path1)
+    {
+        m_processFn(data, sizeBytes);
+        return;
+    }
+
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
