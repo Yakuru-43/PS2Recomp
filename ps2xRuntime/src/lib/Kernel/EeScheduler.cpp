@@ -349,6 +349,7 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                releaseInvocationStack(running->id, running->invocations.size());
                 if (completed.onComplete)
                 {
                     try
@@ -1368,6 +1369,21 @@ uint32_t EeScheduler::invocationStackTop()
 // Stacks are keyed per (thread, depth) and the pool only bumps down, so without
 // this every thread that ever took an invocation holds 16 KiB forever -- DQ8
 // starts one thread per movie and drained all 16 slots on the second one.
+// A stack is only in use while its invocation runs. Interrupts land on
+// whichever thread is current, so keeping one per (thread, depth) until the
+// thread exits ran the 16-slot pool dry once VIF1 ran on the MTVU worker and
+// its interrupts reached threads that never took one before.
+void EeScheduler::releaseInvocationStack(int threadId, size_t depth)
+{
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(threadId)) << 32u) |
+                         static_cast<uint32_t>(depth);
+    const auto held = m_invocationStackTops.find(key);
+    if (held == m_invocationStackTops.end())
+        return;
+    m_freeInvocationStacks.push_back(held->second);
+    m_invocationStackTops.erase(held);
+}
+
 void EeScheduler::releaseInvocationStacks(int threadId)
 {
     const uint64_t prefix = static_cast<uint64_t>(static_cast<uint32_t>(threadId)) << 32u;
@@ -2131,7 +2147,11 @@ void EeScheduler::processPendingEvents()
         }
     }
     // INTC VIF0 (4) and VIF1 (5), raised by a VIFcode carrying the i bit.
-    const uint32_t vifInterrupts = m_runtime.memory().takePendingVifInterrupts();
+    // Not inside another handler: the EE takes no interrupt while one is
+    // being handled, so they stay pending until it returns. VIF1 run on the
+    // MTVU worker raises them at any moment, and nesting them on whatever
+    // thread was interrupted used up the invocation stacks.
+    const uint32_t vifInterrupts = m_insideInterrupt ? 0u : m_runtime.memory().takePendingVifInterrupts();
     if ((vifInterrupts & 0x1u) != 0u)
     {
         dispatchIrq(false, 4u);

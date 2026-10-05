@@ -6,10 +6,15 @@
 #include <array>
 #include <functional>
 #include <vector>
+#include <string>
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -348,6 +353,27 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
+
+    // MTVU: VIF1 -- and with it VU1 -- and GIF DMA data run on a worker
+    // thread, in order, as VU1 runs beside the EE on a PS2. The EE side
+    // calls mtvuSync() before it observes anything that work produces:
+    // VIF1/GIF registers, VU1 memory, GS privileged registers, the GS.
+    void setMtvuEnabled(bool enabled);
+    bool mtvuEnabled() const { return m_mtvuEnabled.load(std::memory_order_acquire); }
+    // Waits for queued work. A no-op on the worker, or with nothing queued.
+    void mtvuSync() const;
+    // The VU0 FBRST bits (VU1 D/T enables) the EE had when it queued the job
+    // the worker is running: the worker cannot read the EE's thread context.
+    void setMtvuFbrstSource(std::function<uint32_t()> source) { m_mtvuFbrstSource = std::move(source); }
+    uint32_t mtvuJobFbrst() const { return m_mtvuJobFbrst; }
+    bool onMtvuThread() const;
+    struct MtvuStats
+    {
+        uint64_t jobs = 0;
+        uint64_t waits = 0;
+        uint64_t waitNanos = 0;
+    };
+    MtvuStats takeMtvuStats();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
     int pollDmaRegisters();
@@ -423,6 +449,36 @@ public:
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
     };
+    void processGifTransfers(std::vector<PendingTransfer> &transfers);
+    void processVif1Transfers(std::vector<PendingTransfer> &transfers);
+    // Copies a transfer's source bytes into chainData, as the DMA reads them now.
+    void materializeTransfer(PendingTransfer &transfer);
+    void mtvuEnqueue(std::vector<PendingTransfer> &gif, std::vector<PendingTransfer> &vif1);
+    void mtvuRun();
+    struct MtvuJob
+    {
+        std::vector<PendingTransfer> gif;
+        std::vector<PendingTransfer> vif1;
+        size_t bytes = 0;
+        uint32_t fbrst = 0;
+    };
+    std::function<uint32_t()> m_mtvuFbrstSource;
+    uint32_t m_mtvuJobFbrst = 0;
+    static constexpr size_t kMtvuQueueBytes = 512u * 1024u;
+    mutable std::mutex m_mtvuMutex;
+    mutable std::condition_variable m_mtvuWork;
+    mutable std::condition_variable m_mtvuDone;
+    std::deque<MtvuJob> m_mtvuQueue;
+    size_t m_mtvuQueuedBytes = 0;
+    bool m_mtvuStop = false;
+    std::exception_ptr m_mtvuError;
+    std::thread m_mtvuThread;
+    std::thread::id m_mtvuThreadId;
+    std::atomic<bool> m_mtvuThreadRunning{false};
+    std::atomic<bool> m_mtvuEnabled{false};
+    std::atomic<uint32_t> m_mtvuPending{0};
+    mutable MtvuStats m_mtvuStats;
+
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;

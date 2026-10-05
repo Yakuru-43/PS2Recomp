@@ -1881,6 +1881,8 @@ namespace
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
+        // The display moves to a buffer queued VU1 work may still be drawing.
+        runtime->memory().mtvuSync();
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
