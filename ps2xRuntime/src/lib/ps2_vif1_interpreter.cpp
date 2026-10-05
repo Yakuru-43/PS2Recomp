@@ -592,7 +592,65 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            // The common case -- no mask, no row/col addition, no fill
+            // cycle -- reduced to a decode per vector. Same result as the
+            // general loop below, which DQ8's skinned characters spent a
+            // tenth of the VU1 thread in.
+            const bool fastFormat = vl <= 2u || (vl == 3u && vn == 3u);
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable &&
+                (vif1_regs.mode & 3u) == 0u && cl >= wl && fastFormat)
+            {
+                const uint8_t *srcBase = data + pos;
+                const uint32_t lanesWritten = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                {
+                    const uint32_t destVec = (vuAddr + (writeIndex / wl) * cl + writeIndex % wl) & 0x3FFu;
+                    const uint32_t destOff = destVec * 16u;
+                    if (destOff + 16u > PS2_VU1_DATA_SIZE)
+                        continue;
+                    const uint8_t *srcVec = srcBase + writeIndex * bytesPerVector;
+                    uint32_t lanes[4];
+                    std::memcpy(lanes, m_vu1Data + destOff, sizeof(lanes));
+                    if (vl == 3u)
+                    {
+                        uint16_t packed = 0;
+                        std::memcpy(&packed, srcVec, sizeof(packed));
+                        lanes[0] = packed & 0x1Fu;
+                        lanes[1] = (packed >> 5) & 0x1Fu;
+                        lanes[2] = (packed >> 10) & 0x1Fu;
+                        lanes[3] = (packed >> 15) & 0x01u;
+                    }
+                    else
+                    {
+                        uint32_t values[4];
+                        for (uint32_t c = 0; c < lanesWritten; ++c)
+                        {
+                            if (vl == 0u)
+                            {
+                                std::memcpy(&values[c], srcVec + c * 4u, sizeof(uint32_t));
+                            }
+                            else if (vl == 1u)
+                            {
+                                uint16_t raw;
+                                std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                                values[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                            }
+                            else
+                            {
+                                const uint8_t raw = srcVec[c];
+                                values[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+                            }
+                        }
+                        if (lanesWritten == 1u)
+                            lanes[0] = lanes[1] = lanes[2] = lanes[3] = values[0];
+                        else
+                            for (uint32_t c = 0; c < lanesWritten; ++c)
+                                lanes[c] = values[c];
+                    }
+                    std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                }
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;

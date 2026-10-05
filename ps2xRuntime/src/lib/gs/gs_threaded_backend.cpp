@@ -100,8 +100,14 @@ struct GSThreadedBackend::Impl
         // primitives per second, and taking the queue lock and waking the
         // worker for each one cost more than the copies themselves. An idle
         // worker gets them at once, so batching never leaves it waiting.
+        // An idle worker still gets a small group rather than each command:
+        // with VU1 on its own thread it is idle about half the time, and a
+        // lock, notify and wake per primitive cost the producer a tenth of
+        // its time. A short tail is never stranded -- an idle worker takes
+        // staged work itself within 2 ms, and presentation flushes.
         if (flush || staged.size() >= kStageCommands ||
-            stagedBytes >= std::min(kStageBytes, capacity) || idle.load(std::memory_order_acquire))
+            stagedBytes >= std::min(kStageBytes, capacity) ||
+            (staged.size() >= kIdleStageCommands && idle.load(std::memory_order_acquire)))
             publishStaged(flush);
     }
 
@@ -345,6 +351,7 @@ struct GSThreadedBackend::Impl
     size_t stagedBytes = 0u;
     std::atomic<bool> idle{false}; // the worker is waiting for commands
     static constexpr size_t kStageCommands = 128u;
+    static constexpr size_t kIdleStageCommands = 16u;
     static constexpr size_t kStageBytes = 256u * 1024u;
     size_t outstandingBytes = 0u;
     bool urgent = false, stopping = false;

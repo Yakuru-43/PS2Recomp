@@ -326,6 +326,7 @@ public:
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
     [[nodiscard]] uint32_t invocationStackTop();
     void releaseInvocationStacks(int threadId);
+    void releaseInvocationStack(int threadId, size_t depth);
 
     int addIrqHandler(bool dmac,
                       uint32_t cause,

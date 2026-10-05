@@ -4,10 +4,17 @@
 #include "ps2_log.h"
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -247,6 +254,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    setMtvuEnabled(false);
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -603,11 +611,16 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     {
         return ptr;
     }
+    // VU1 memory belongs to the MTVU worker while it has work queued.
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
+        mtvuSync();
         return ptr;
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    const uint8_t *ptr = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (ptr)
+        mtvuSync();
+    return ptr;
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -789,6 +802,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        mtvuSync();
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -837,6 +851,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        mtvuSync();
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -998,6 +1013,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        mtvuSync();
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1058,6 +1074,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        mtvuSync();
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1154,6 +1171,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    // GIF and VIF1 registers and FIFOs report the MTVU worker's progress.
+    if ((address >= 0x10003000u && address < 0x10003100u) ||
+        (address >= 0x10003C00u && address < 0x10003E00u) ||
+        (address >= 0x10005000u && address < 0x10007000u))
+        mtvuSync();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1191,6 +1213,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        mtvuSync();
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
@@ -1621,12 +1644,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
-void PS2Memory::processPendingTransfers()
+void PS2Memory::processGifTransfers(std::vector<PendingTransfer> &transfers)
 {
-    const bool hadGif = !m_pendingGifTransfers.empty();
-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+    for (size_t idx = 0; idx < transfers.size(); ++idx)
     {
-        auto &p = m_pendingGifTransfers[idx];
+        auto &p = transfers[idx];
         if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
@@ -1686,6 +1708,90 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+}
+
+void PS2Memory::processVif1Transfers(std::vector<PendingTransfer> &transfers)
+{
+    for (auto &p : transfers)
+    {
+        if (!p.chainData.empty())
+        {
+            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+        }
+        else if (p.qwc > 0)
+        {
+            uint32_t srcPhys = 0;
+            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+            try
+            {
+                srcPhys = translateAddress(p.srcAddr);
+            }
+            catch (const std::exception &)
+            {
+                continue;
+            }
+            if (p.fromScratchpad)
+            {
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
+                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
+            }
+            else
+            {
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= PS2_RAM_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_RAM_SIZE)
+                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
+                    processVIF1Data(srcPhys, chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
+            }
+        }
+    }
+}
+
+void PS2Memory::processPendingTransfers()
+{
+    // MTVU: GIF (PATH3) and VIF1 (VU1, PATH1/2) data goes to the worker
+    // thread with its own copy of the bytes, in order. VIF0 runs here, and the
+    // channels complete at once as before: the copy is what the DMA read.
+    const bool queue = mtvuEnabled() && !onMtvuThread() &&
+                       (!m_pendingGifTransfers.empty() || !m_pendingVif1Transfers.empty());
+    const bool hadGif = !m_pendingGifTransfers.empty();
+    const bool hadVif1Queued = !m_pendingVif1Transfers.empty();
+    if (queue)
+    {
+        mtvuEnqueue(m_pendingGifTransfers, m_pendingVif1Transfers);
+        // PS2_MTVU=2: the same hand-off, waited for at once, which must
+        // reproduce single-threaded output exactly. A check of the plumbing.
+        static const bool lockstep = [] {
+            const char *mode = std::getenv("PS2_MTVU");
+            return mode && std::strcmp(mode, "2") == 0;
+        }();
+        if (lockstep)
+            mtvuSync();
+    }
+    else
+        processGifTransfers(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -1746,66 +1852,14 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif0Transfers.clear();
 
-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
-    for (auto &p : m_pendingVif1Transfers)
+    const bool hadVif1 = hadVif1Queued;
+    if (!queue)
     {
-        if (!p.chainData.empty())
-        {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
-        }
-        else if (p.qwc > 0)
-        {
-            uint32_t srcPhys = 0;
-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-            try
-            {
-                srcPhys = translateAddress(p.srcAddr);
-            }
-            catch (const std::exception &)
-            {
-                continue;
-            }
-            if (p.fromScratchpad)
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-            else
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_RAM_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-        }
+        processVif1Transfers(m_pendingVif1Transfers);
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
     }
     m_pendingVif1Transfers.clear();
-
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -1850,6 +1904,193 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
+// ---------------------------------------------------------------------
+// MTVU: VIF1 (and so VU1) and GIF on their own thread
+// ---------------------------------------------------------------------
+
+void PS2Memory::materializeTransfer(PendingTransfer &transfer)
+{
+    if (!transfer.chainData.empty() || transfer.qwc == 0u)
+        return;
+    const uint64_t bytes64 = static_cast<uint64_t>(transfer.qwc) * 16ull;
+    uint32_t bytesLeft = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+    uint32_t srcPhys = 0;
+    try
+    {
+        srcPhys = translateAddress(transfer.srcAddr);
+    }
+    catch (const std::exception &)
+    {
+        transfer.qwc = 0u;
+        return;
+    }
+    const uint8_t *base = transfer.fromScratchpad ? m_scratchpad : m_rdram;
+    const uint32_t limit = transfer.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+    transfer.chainData.reserve(bytesLeft);
+    while (bytesLeft > 0u)
+    {
+        if (srcPhys >= limit)
+            srcPhys = 0;
+        const uint32_t chunk = std::min(bytesLeft, limit - srcPhys);
+        if (chunk == 0u)
+            break;
+        transfer.chainData.insert(transfer.chainData.end(), base + srcPhys, base + srcPhys + chunk);
+        bytesLeft -= chunk;
+        srcPhys += chunk;
+    }
+}
+
+void PS2Memory::mtvuEnqueue(std::vector<PendingTransfer> &gif, std::vector<PendingTransfer> &vif1)
+{
+    MtvuJob job;
+    for (auto &transfer : gif)
+    {
+        materializeTransfer(transfer);
+        job.bytes += transfer.chainData.size();
+    }
+    for (auto &transfer : vif1)
+    {
+        materializeTransfer(transfer);
+        job.bytes += transfer.chainData.size();
+    }
+    job.gif.swap(gif);
+    job.vif1.swap(vif1);
+    job.fbrst = m_mtvuFbrstSource ? m_mtvuFbrstSource() : 0u;
+    std::unique_lock<std::mutex> lock(m_mtvuMutex);
+    // Bounded, so the EE stays close behind VU1 as on the hardware, where VIF
+    // stalls hold the DMA back. With frames queued, DQ8's texture streaming
+    // behaved differently: nine times the textures, and the GS worker drowned
+    // in invalidations. PS2_MTVU_QUEUE_KB overrides the bound.
+    static const size_t queueBytes = [] {
+        const char *value = std::getenv("PS2_MTVU_QUEUE_KB");
+        const long kib = value ? std::atol(value) : 0;
+        return kib > 0 ? static_cast<size_t>(kib) * 1024u : kMtvuQueueBytes;
+    }();
+    m_mtvuDone.wait(lock, [&] { return m_mtvuQueuedBytes < queueBytes || m_mtvuError; });
+    if (m_mtvuError)
+        std::rethrow_exception(m_mtvuError);
+    m_mtvuQueuedBytes += job.bytes;
+    m_mtvuQueue.push_back(std::move(job));
+    m_mtvuPending.fetch_add(1u, std::memory_order_acq_rel);
+    ++m_mtvuStats.jobs;
+    m_mtvuWork.notify_one();
+    lock.unlock();
+
+    // PS2_MTVU_STATS: every two seconds, how often the EE waited for it.
+    static const bool stats = std::getenv("PS2_MTVU_STATS") != nullptr;
+    static auto last = std::chrono::steady_clock::now();
+    if (stats)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - last).count();
+        if (seconds >= 2.0)
+        {
+            last = now;
+            const MtvuStats taken = takeMtvuStats();
+            std::fprintf(stderr, "[mtvu] over %.2fs: jobs=%llu ee-waits=%llu (%.0f ms)\n", seconds,
+                         static_cast<unsigned long long>(taken.jobs),
+                         static_cast<unsigned long long>(taken.waits), taken.waitNanos / 1e6);
+        }
+    }
+}
+
+void PS2Memory::mtvuRun()
+{
+    for (;;)
+    {
+        MtvuJob job;
+        {
+            std::unique_lock<std::mutex> lock(m_mtvuMutex);
+            m_mtvuWork.wait(lock, [&] { return m_mtvuStop || !m_mtvuQueue.empty(); });
+            if (m_mtvuQueue.empty())
+                return;
+            job = std::move(m_mtvuQueue.front());
+            m_mtvuQueue.pop_front();
+        }
+        m_mtvuJobFbrst = job.fbrst;
+        try
+        {
+            processGifTransfers(job.gif);
+            processVif1Transfers(job.vif1);
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lock(m_mtvuMutex);
+            m_mtvuError = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mtvuMutex);
+            m_mtvuQueuedBytes -= job.bytes;
+            m_mtvuPending.fetch_sub(1u, std::memory_order_acq_rel);
+        }
+        m_mtvuDone.notify_all();
+    }
+}
+
+void PS2Memory::mtvuSync() const
+{
+    if (m_mtvuPending.load(std::memory_order_acquire) == 0u || onMtvuThread())
+        return;
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(m_mtvuMutex);
+    m_mtvuDone.wait(lock, [&] { return m_mtvuPending.load(std::memory_order_acquire) == 0u || m_mtvuError; });
+    const uint64_t nanos = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    ++m_mtvuStats.waits;
+    m_mtvuStats.waitNanos += nanos;
+    if (m_mtvuError)
+        std::rethrow_exception(m_mtvuError);
+}
+
+bool PS2Memory::onMtvuThread() const
+{
+    return m_mtvuThreadRunning.load(std::memory_order_acquire) &&
+           std::this_thread::get_id() == m_mtvuThreadId;
+}
+
+void PS2Memory::setMtvuEnabled(bool enabled)
+{
+    if (enabled == m_mtvuEnabled.load(std::memory_order_acquire))
+        return;
+    if (enabled)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mtvuMutex);
+            m_mtvuStop = false;
+            m_mtvuError = nullptr;
+        }
+        m_mtvuThread = std::thread([this] {
+#if defined(__linux__)
+            pthread_setname_np(pthread_self(), "VU1Thread");
+#endif
+            mtvuRun();
+        });
+        m_mtvuThreadId = m_mtvuThread.get_id();
+        m_mtvuThreadRunning.store(true, std::memory_order_release);
+        m_mtvuEnabled.store(true, std::memory_order_release);
+        return;
+    }
+    m_mtvuEnabled.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_mtvuMutex);
+        m_mtvuStop = true;
+    }
+    m_mtvuWork.notify_one();
+    if (m_mtvuThread.joinable())
+        m_mtvuThread.join();
+    m_mtvuThreadRunning.store(false, std::memory_order_release);
+}
+
+PS2Memory::MtvuStats PS2Memory::takeMtvuStats()
+{
+    std::lock_guard<std::mutex> lock(m_mtvuMutex);
+    const MtvuStats stats = m_mtvuStats;
+    m_mtvuStats = {};
+    return stats;
+}
+
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
@@ -1890,6 +2131,7 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    mtvuSync();
     if (!data || sizeBytes < 16)
         return;
 
@@ -1914,6 +2156,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 {
+    mtvuSync();
     if (!m_rdram || qwCount == 0)
         return;
     const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
@@ -1940,6 +2183,7 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 
 void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    mtvuSync();
     if (m_gifArbiter)
         submitGifPacket(GifPathId::Path3, data, sizeBytes);
     else if (m_gifPacketCallback && data && sizeBytes >= 16)
@@ -1948,6 +2192,8 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    // These submit to the GS here and now, so queued MTVU work goes first.
+    mtvuSync();
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2140,6 +2386,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    // These submit to the GS here and now, so queued MTVU work goes first.
+    mtvuSync();
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2225,6 +2473,11 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    // GIF and VIF1 registers and FIFOs report the MTVU worker's progress.
+    if ((address >= 0x10003000u && address < 0x10003100u) ||
+        (address >= 0x10003C00u && address < 0x10003E00u) ||
+        (address >= 0x10005000u && address < 0x10007000u))
+        mtvuSync();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -2247,6 +2500,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        mtvuSync();
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
